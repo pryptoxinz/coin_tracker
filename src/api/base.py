@@ -35,7 +35,7 @@ class BaseAPI(ABC):
     async def _make_request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
         await self._rate_limit_check()
         
-        if not self.session:
+        if not self.session or self.session.closed:
             self.session = aiohttp.ClientSession()
         
         url = f"{self.base_url}{endpoint}"

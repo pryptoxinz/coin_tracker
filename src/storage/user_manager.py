@@ -187,6 +187,21 @@ class UserManager:
             return user['entry_prices'][token_address]['price']
         return None
     
+    def set_entry_price(self, user_id: str, token_address: str, price: float) -> bool:
+        """Set entry price for a token (used for backfilling)"""
+        if user_id not in self.users:
+            return False
+        
+        if token_address not in self.users[user_id]['tracked_tokens']:
+            return False
+        
+        self.users[user_id]['entry_prices'][token_address] = {
+            'price': price,
+            'timestamp': datetime.now().isoformat()
+        }
+        self._save_users()
+        return True
+    
     def get_all_tracked_tokens(self) -> set:
         """Get set of all tokens being tracked by any active user"""
         all_tokens = set()
@@ -194,3 +209,29 @@ class UserManager:
             if data.get('active', False):
                 all_tokens.update(data.get('tracked_tokens', []))
         return all_tokens
+    
+    def deactivate_user(self, user_id: str) -> bool:
+        """Deactivate a user (stop receiving alerts)"""
+        if user_id not in self.users:
+            return False
+        
+        self.users[user_id]['active'] = False
+        self._save_users()
+        logger.info(f"Deactivated user: {user_id}")
+        return True
+    
+    def set_entry_price(self, user_id: str, token_address: str, price: float) -> bool:
+        """Set entry price for a token (used for backfilling missing entry prices)"""
+        if user_id not in self.users:
+            return False
+        
+        if 'entry_prices' not in self.users[user_id]:
+            self.users[user_id]['entry_prices'] = {}
+        
+        self.users[user_id]['entry_prices'][token_address] = {
+            'price': price,
+            'timestamp': datetime.now().isoformat()
+        }
+        self._save_users()
+        logger.info(f"Set entry price for user {user_id}, token {token_address}: ${price:.8f}")
+        return True

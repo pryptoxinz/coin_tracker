@@ -2,10 +2,17 @@
   "625872305": {
     "active": true,
     "registered_at": "Wed Jun  4 07:45:21 PM CEST 2025",
-    "tracked_tokens": [],
+    "tracked_tokens": [
+      "DFfPq2hHbJeunp1F6eNyuyvBHcPpnTqaawn2tAFUpump"
+    ],
     "global_threshold": 20.0,
     "token_thresholds": {},
-    "entry_prices": {}
+    "entry_prices": {
+      "DFfPq2hHbJeunp1F6eNyuyvBHcPpnTqaawn2tAFUpump": {
+        "price": 0.00123456,
+        "timestamp": "2025-06-05T01:14:01.774423"
+      }
+    }
   },
   "123456789": {
     "active": true,

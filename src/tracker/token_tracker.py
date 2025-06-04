@@ -32,6 +32,7 @@ class TokenTracker:
         await self.notifier.start()
         
         await self._initialize_cache()
+        await self._backfill_missing_entry_prices()
         
         tasks = [
             asyncio.create_task(self._track_prices()),
@@ -64,6 +65,36 @@ class TokenTracker:
                     self._user_price_cache[user_id][token] = entry_price
                 elif token in self._price_cache:
                     self._user_price_cache[user_id][token] = self._price_cache[token]
+    
+    async def _backfill_missing_entry_prices(self):
+        """Backfill missing entry prices for tokens that don't have them"""
+        logger.info("🔧 Starting entry price backfill for tracked tokens...")
+        backfilled_count = 0
+        
+        for user_id in self.user_manager.get_active_users():
+            user_tokens = self.user_manager.get_user_tokens(user_id)
+            for token_address in user_tokens:
+                entry_price = self.user_manager.get_entry_price(user_id, token_address)
+                
+                if entry_price is None:
+                    # Missing entry price, try to get current price and set it
+                    try:
+                        price_data = await self.dexscreener_api.get_token_price(token_address)
+                        current_price = price_data['price']
+                        
+                        # Set current price as entry price for backfill
+                        self.user_manager.set_entry_price(user_id, token_address, current_price)
+                        backfilled_count += 1
+                        
+                        logger.info(f"✅ Backfilled entry price for user {user_id}, token {price_data.get('symbol', token_address[:8])}: ${current_price:.8f}")
+                        
+                    except Exception as e:
+                        logger.warning(f"❌ Could not backfill entry price for user {user_id}, token {token_address}: {e}")
+        
+        if backfilled_count > 0:
+            logger.info(f"🎯 Entry price backfill complete: {backfilled_count} tokens updated")
+        else:
+            logger.info("✅ All tracked tokens already have entry prices")
     
     async def _track_prices(self):
         async with self.dexscreener_api:
@@ -98,8 +129,7 @@ class TokenTracker:
     async def _check_price(self, token_address: str):
         try:
             logger.info(f"Checking price for token {token_address}")
-            async with self.dexscreener_api:
-                price_data = await self.dexscreener_api.get_token_price(token_address)
+            price_data = await self.dexscreener_api.get_token_price(token_address)
             current_price = price_data['price']
             
             # Log detailed token information
@@ -179,8 +209,7 @@ class TokenTracker:
     async def _check_holders(self, token_address: str):
         try:
             logger.info(f"Checking holder count for token {token_address}")
-            async with self.solana_tracker:
-                holder_count = await self.solana_tracker.get_token_holders_count(token_address)
+            holder_count = await self.solana_tracker.get_token_holders_count(token_address)
             
             logger.info(f"Token {token_address} has {holder_count} holders")
             
@@ -203,10 +232,10 @@ class TokenTracker:
                         # Get token info for better alert message
                         token_info = {'name': 'Unknown', 'symbol': 'UNK'}
                         try:
-                            async with self.dexscreener_api:
-                                price_data = await self.dexscreener_api.get_token_price(token_address)
+                            price_data = await self.dexscreener_api.get_token_price(token_address)
                             token_info = {'name': price_data.get('name', 'Unknown'), 'symbol': price_data.get('symbol', 'UNK')}
-                        except:
+                        except Exception as e:
+                            logger.debug(f"Could not get token info for holder alert: {e}")
                             pass
                         
                         alert_data = {
@@ -263,8 +292,7 @@ class TokenTracker:
         # Get current price as entry price
         entry_price = None
         try:
-            async with self.dexscreener_api:
-                price_data = await self.dexscreener_api.get_token_price(token_address)
+            price_data = await self.dexscreener_api.get_token_price(token_address)
             entry_price = price_data['price']
         except Exception as e:
             logger.error(f"Error getting entry price for {token_address}: {e}")
@@ -346,8 +374,7 @@ class TokenTracker:
         
         try:
             # Get current price
-            async with self.dexscreener_api:
-                price_data = await self.dexscreener_api.get_token_price(token_address)
+            price_data = await self.dexscreener_api.get_token_price(token_address)
             current_price = price_data['price']
             
             # Update user's price cache with new reference price
@@ -420,13 +447,13 @@ class TokenTracker:
                     all_tokens = self.user_manager.get_all_tracked_tokens()
                     for tracked_address in all_tokens:
                         try:
-                            async with self.dexscreener_api:
-                                temp_data = await self.dexscreener_api.get_token_price(tracked_address)
+                            temp_data = await self.dexscreener_api.get_token_price(tracked_address)
                             if (temp_data['name'].lower() == token_identifier.lower() or 
                                 temp_data['symbol'].lower() == token_identifier.lower()):
                                 token_address = tracked_address
                                 break
-                        except:
+                        except Exception as e:
+                            logger.debug(f"Could not get token info for {tracked_address}: {e}")
                             continue
                     else:
                         raise APIError(f"Token '{token_identifier}' not found in tracked tokens")
@@ -437,8 +464,7 @@ class TokenTracker:
                 raise APIError(f"Token '{token_identifier}' is not being tracked by any user")
             
             # Get current data
-            async with self.dexscreener_api:
-                token_data = await self.dexscreener_api.get_token_price(token_address)
+            token_data = await self.dexscreener_api.get_token_price(token_address)
             
             # Try to get holder count
             try:
@@ -462,8 +488,7 @@ class TokenTracker:
         """Send Telegram confirmation with detailed token information when a new token is added"""
         try:
             # Get detailed token data from DexScreener
-            async with self.dexscreener_api:
-                token_data = await self.dexscreener_api.get_token_price(token_address)
+            token_data = await self.dexscreener_api.get_token_price(token_address)
             
             # Try to get holder count
             try:
