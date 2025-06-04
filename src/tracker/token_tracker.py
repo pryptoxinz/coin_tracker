@@ -4,6 +4,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime
 from ..api import DexScreenerAPI, SolanaTracker, APIError
 from ..storage import CSVStorage
+from ..storage.user_manager import UserManager
 from ..bot import TelegramNotifier
 from ..utils import config
 
@@ -11,15 +12,11 @@ logger = logging.getLogger(__name__)
 
 class TokenTracker:
     def __init__(self, 
-                 tokens: List[str],
-                 price_threshold: float,
+                 user_manager: UserManager,
                  storage: CSVStorage,
                  notifier: TelegramNotifier,
-                 check_interval: int = 60,
-                 token_thresholds: Dict[str, Dict] = None):
-        self.tokens = tokens
-        self.price_threshold = price_threshold
-        self.token_thresholds = token_thresholds or {}
+                 check_interval: int = 60):
+        self.user_manager = user_manager
         self.storage = storage
         self.notifier = notifier
         self.check_interval = check_interval
@@ -28,6 +25,7 @@ class TokenTracker:
         self._running = False
         self._price_cache: Dict[str, float] = {}
         self._holder_cache: Dict[str, int] = {}
+        self._user_price_cache: Dict[str, Dict[str, float]] = {}  # Per-user price tracking
     
     async def start(self):
         self._running = True
@@ -49,16 +47,32 @@ class TokenTracker:
         await self.solana_tracker.__aexit__(None, None, None)
     
     async def _initialize_cache(self):
-        for token in self.tokens:
+        # Initialize global price cache for all tracked tokens
+        all_tokens = self.user_manager.get_all_tracked_tokens()
+        for token in all_tokens:
             latest_price = await self.storage.get_latest_price(token)
             if latest_price:
                 self._price_cache[token] = latest_price['price']
+        
+        # Initialize per-user price cache with entry prices
+        for user_id in self.user_manager.get_active_users():
+            self._user_price_cache[user_id] = {}
+            user_tokens = self.user_manager.get_user_tokens(user_id)
+            for token in user_tokens:
+                entry_price = self.user_manager.get_entry_price(user_id, token)
+                if entry_price:
+                    self._user_price_cache[user_id][token] = entry_price
+                elif token in self._price_cache:
+                    self._user_price_cache[user_id][token] = self._price_cache[token]
     
     async def _track_prices(self):
         async with self.dexscreener_api:
             while self._running:
                 try:
-                    for token in self.tokens:
+                    # Get all unique tokens being tracked by any user
+                    all_tokens = self.user_manager.get_all_tracked_tokens()
+                    
+                    for token in all_tokens:
                         await self._check_price(token)
                     
                     await asyncio.sleep(self.check_interval)
@@ -70,7 +84,10 @@ class TokenTracker:
         async with self.solana_tracker:
             while self._running:
                 try:
-                    for token in self.tokens:
+                    # Get all unique tokens being tracked by any user
+                    all_tokens = self.user_manager.get_all_tracked_tokens()
+                    
+                    for token in all_tokens:
                         await self._check_holders(token)
                     
                     await asyncio.sleep(self.check_interval * 5)
@@ -90,16 +107,20 @@ class TokenTracker:
             
             await self.storage.save_price_data(token_address, price_data)
             
-            if token_address in self._price_cache:
-                old_price = self._price_cache[token_address]
-                if old_price > 0:
-                    change_percent = ((current_price - old_price) / old_price) * 100
-                    logger.info(f"Price change for {price_data['symbol']}: {change_percent:+.2f}%")
+            # Check price changes for each user tracking this token
+            users_tracking = self.user_manager.get_users_tracking_token(token_address)
+            
+            for user_id in users_tracking:
+                # Get user's reference price (entry price or last alert price)
+                user_ref_price = self._user_price_cache.get(user_id, {}).get(token_address)
+                
+                if user_ref_price and user_ref_price > 0:
+                    change_percent = ((current_price - user_ref_price) / user_ref_price) * 100
                     
-                    # Use token-specific threshold if available, otherwise use global threshold
-                    token_config = self.token_thresholds.get(token_address, {'value': self.price_threshold, 'direction': 'both'})
-                    token_threshold = token_config.get('value', self.price_threshold)
-                    token_direction = token_config.get('direction', 'both')
+                    # Get user-specific threshold
+                    threshold_config = self.user_manager.get_user_threshold(user_id, token_address)
+                    token_threshold = threshold_config['value']
+                    token_direction = threshold_config['direction']
                     
                     # Check if the change meets the directional criteria
                     meets_threshold = False
@@ -111,35 +132,42 @@ class TokenTracker:
                         meets_threshold = change_percent <= -token_threshold
                     
                     if meets_threshold:
-                        logger.warning(f"PRICE ALERT: {price_data['name']} ({price_data['symbol']}) changed {change_percent:+.2f}%")
+                        logger.warning(f"PRICE ALERT for user {user_id}: {price_data['name']} ({price_data['symbol']}) changed {change_percent:+.2f}%")
                         
                         alert_data = {
                             'token_address': token_address,
                             'token_name': price_data['name'],
                             'token_symbol': price_data['symbol'],
-                            'old_price': old_price,
+                            'old_price': user_ref_price,
                             'new_price': current_price,
                             'change_percent': change_percent,
                             'market_cap': price_data.get('market_cap', 0),
                             'liquidity': price_data.get('liquidity', 0),
                             'volume_24h': price_data.get('volume_24h', 0),
-                            'dex': price_data.get('dex', 'unknown')
+                            'dex': price_data.get('dex', 'unknown'),
+                            'user_id': user_id,
+                            'entry_price': self.user_manager.get_entry_price(user_id, token_address)
                         }
                         
-                        await self.notifier.send_price_alert(alert_data)
+                        await self.notifier.send_price_alert_to_user(user_id, alert_data)
                         
                         await self.storage.save_alert_log({
                             'token_address': token_address,
                             'alert_type': 'price',
-                            'old_value': old_price,
+                            'old_value': user_ref_price,
                             'new_value': current_price,
-                            'change_percent': change_percent
+                            'change_percent': change_percent,
+                            'user_id': user_id
                         })
                     else:
                         direction_str = f"({token_direction})" if token_direction != 'both' else ""
-                        logger.debug(f"Price change for {price_data['symbol']} ({change_percent:+.2f}%) below threshold ({token_threshold}% {direction_str})")
-            else:
-                logger.info(f"New token added to tracking: {price_data['name']} ({price_data['symbol']}) at ${current_price:.8f}")
+                        logger.debug(f"Price change for {price_data['symbol']} user {user_id} ({change_percent:+.2f}%) below threshold ({token_threshold}% {direction_str})")
+                else:
+                    # First time tracking for this user
+                    if user_id not in self._user_price_cache:
+                        self._user_price_cache[user_id] = {}
+                    self._user_price_cache[user_id][token_address] = current_price
+                    logger.info(f"Initialized price tracking for user {user_id}: {price_data['name']} ({price_data['symbol']}) at ${current_price:.8f}")
             
             self._price_cache[token_address] = current_price
             
@@ -169,21 +197,42 @@ class TokenTracker:
                     if abs(change) >= 10 or abs(change_percent) >= 10:
                         logger.warning(f"HOLDER ALERT: Token {token_address} holder count changed by {change:+d} ({change_percent:+.1f}%)")
                         
+                        # Get users tracking this token to send alerts only to them
+                        users_tracking = self.user_manager.get_users_tracking_token(token_address)
+                        
+                        # Get token info for better alert message
+                        token_info = {'name': 'Unknown', 'symbol': 'UNK'}
+                        try:
+                            async with self.dexscreener_api:
+                                price_data = await self.dexscreener_api.get_token_price(token_address)
+                            token_info = {'name': price_data.get('name', 'Unknown'), 'symbol': price_data.get('symbol', 'UNK')}
+                        except:
+                            pass
+                        
                         alert_data = {
                             'token_address': token_address,
+                            'token_name': token_info['name'],
+                            'token_symbol': token_info['symbol'],
                             'old_holders': old_count,
-                            'new_holders': holder_count
+                            'new_holders': holder_count,
+                            'change': change,
+                            'change_percent': change_percent
                         }
                         
-                        await self.notifier.send_holder_alert(alert_data)
+                        # Send alert to each user tracking this token
+                        for user_id in users_tracking:
+                            await self.notifier.send_holder_alert_to_user(user_id, alert_data)
                         
-                        await self.storage.save_alert_log({
-                            'token_address': token_address,
-                            'alert_type': 'holders',
-                            'old_value': old_count,
-                            'new_value': holder_count,
-                            'change_percent': change_percent
-                        })
+                        # Save alert log for each user
+                        for user_id in users_tracking:
+                            await self.storage.save_alert_log({
+                                'token_address': token_address,
+                                'alert_type': 'holders',
+                                'old_value': old_count,
+                                'new_value': holder_count,
+                                'change_percent': change_percent,
+                                'user_id': user_id
+                            })
                     else:
                         logger.debug(f"Holder count change for {token_address} ({change:+d}) below alert threshold")
             else:
@@ -196,59 +245,104 @@ class TokenTracker:
             console_msg = f"❌ Error checking holders for {token_address}: {e}"
             print(console_msg)
     
-    async def add_token(self, token_address: str):
-        if token_address not in self.tokens:
-            self.tokens.append(token_address)
-            
-            # Save to persistent storage
-            await self.storage.add_tracked_token(token_address)
-            
-            logger.info(f"✅ Token added to tracking: {token_address}")
-            console_msg = f"✅ Token added to tracking: {token_address}"
+    async def add_token(self, user_id: str, token_address: str):
+        """Add token to user's tracking list"""
+        # Check if user is registered
+        if not self.user_manager.is_user_active(user_id):
+            logger.warning(f"User {user_id} is not registered")
+            return False
+        
+        # Check if user is already tracking this token
+        user_tokens = self.user_manager.get_user_tokens(user_id)
+        if token_address in user_tokens:
+            logger.warning(f"User {user_id} is already tracking token {token_address}")
+            console_msg = f"⚠️ User {user_id} is already tracking token {token_address}"
+            print(console_msg)
+            return False
+        
+        # Get current price as entry price
+        entry_price = None
+        try:
+            async with self.dexscreener_api:
+                price_data = await self.dexscreener_api.get_token_price(token_address)
+            entry_price = price_data['price']
+        except Exception as e:
+            logger.error(f"Error getting entry price for {token_address}: {e}")
+        
+        # Add token to user's list
+        success = self.user_manager.add_token_to_user(user_id, token_address, entry_price)
+        
+        if success:
+            logger.info(f"✅ Token {token_address} added to tracking for user {user_id}")
+            console_msg = f"✅ Token {token_address} added to tracking for user {user_id}"
             print(console_msg)
             
-            # Send Telegram confirmation with token details
-            await self._send_token_added_confirmation(token_address)
+            # Initialize user price cache if needed
+            if user_id not in self._user_price_cache:
+                self._user_price_cache[user_id] = {}
+            if entry_price:
+                self._user_price_cache[user_id][token_address] = entry_price
+            
+            # Send Telegram confirmation with token details to specific user
+            await self._send_token_added_confirmation(user_id, token_address)
+            return True
+        
+        return False
+    
+    async def remove_token(self, user_id: str, token_address: str):
+        """Remove token from user's tracking list"""
+        # Check if user is registered
+        if not self.user_manager.is_user_active(user_id):
+            logger.warning(f"User {user_id} is not registered")
+            return False
+        
+        # Remove token from user's list
+        success = self.user_manager.remove_token_from_user(user_id, token_address)
+        
+        if success:
+            # Remove from user's price cache
+            if user_id in self._user_price_cache and token_address in self._user_price_cache[user_id]:
+                del self._user_price_cache[user_id][token_address]
+            
+            logger.info(f"❌ Token {token_address} removed from tracking for user {user_id}")
+            console_msg = f"❌ Token {token_address} removed from tracking for user {user_id}"
+            print(console_msg)
+            
+            # Check if any other users are still tracking this token
+            users_still_tracking = self.user_manager.get_users_tracking_token(token_address)
+            if not users_still_tracking:
+                # No users tracking this token anymore, remove from global cache
+                self._price_cache.pop(token_address, None)
+                self._holder_cache.pop(token_address, None)
+                logger.info(f"No users tracking {token_address} anymore, removed from global cache")
+            
+            return True
         else:
-            logger.warning(f"Token {token_address} is already being tracked")
-            console_msg = f"⚠️ Token {token_address} is already being tracked"
+            logger.warning(f"User {user_id} was not tracking token {token_address}")
+            console_msg = f"⚠️ User {user_id} was not tracking token {token_address}"
             print(console_msg)
+            return False
     
-    async def remove_token(self, token_address: str):
-        if token_address in self.tokens:
-            self.tokens.remove(token_address)
-            self._price_cache.pop(token_address, None)
-            self._holder_cache.pop(token_address, None)
-            
-            # Remove from persistent storage
-            await self.storage.remove_tracked_token(token_address)
-            
-            logger.info(f"❌ Token removed from tracking: {token_address}")
-            console_msg = f"❌ Token removed from tracking: {token_address}"
-            print(console_msg)
-        else:
-            logger.warning(f"Token {token_address} was not being tracked")
-            console_msg = f"⚠️ Token {token_address} was not being tracked"
-            print(console_msg)
+    def update_threshold(self, user_id: str, new_threshold: float):
+        """Update user's global threshold"""
+        success = self.user_manager.set_user_global_threshold(user_id, new_threshold)
+        if success:
+            logger.info(f"Updated global threshold for user {user_id} to {new_threshold}%")
+        return success
     
-    def update_threshold(self, new_threshold: float):
-        self.price_threshold = new_threshold
+    async def set_token_threshold(self, user_id: str, token_address: str, threshold: float, direction: str = 'both'):
+        """Set a specific threshold and direction for a token for a user"""
+        success = self.user_manager.set_user_token_threshold(user_id, token_address, threshold, direction)
+        if success:
+            logger.info(f"Set token threshold for user {user_id}, token {token_address}: {threshold}% ({direction})")
+        return success
     
-    async def set_token_threshold(self, token_address: str, threshold: float, direction: str = 'both'):
-        """Set a specific threshold and direction for a token"""
-        if token_address in self.tokens:
-            if threshold > 0:
-                self.token_thresholds[token_address] = {'value': threshold, 'direction': direction}
-            else:
-                self.token_thresholds.pop(token_address, None)
-            
-            # Save to storage
-            await self.storage.set_token_threshold(token_address, threshold, direction)
-    
-    async def reset_price_reference(self, token_address: str):
-        """Reset the price reference for a token to current price"""
-        if token_address not in self.tokens:
-            raise ValueError(f"Token {token_address} is not being tracked")
+    async def reset_price_reference(self, user_id: str, token_address: str):
+        """Reset the price reference for a token to current price for a specific user"""
+        # Check if user is tracking this token
+        user_tokens = self.user_manager.get_user_tokens(user_id)
+        if token_address not in user_tokens:
+            raise ValueError(f"User {user_id} is not tracking token {token_address}")
         
         try:
             # Get current price
@@ -256,46 +350,56 @@ class TokenTracker:
                 price_data = await self.dexscreener_api.get_token_price(token_address)
             current_price = price_data['price']
             
-            # Update cache with new reference price
+            # Update user's price cache with new reference price
+            if user_id not in self._user_price_cache:
+                self._user_price_cache[user_id] = {}
+            self._user_price_cache[user_id][token_address] = current_price
+            
+            # Update global price cache
             self._price_cache[token_address] = current_price
             
             # Save the new reference price to storage
             await self.storage.save_price_data(token_address, price_data)
             
-            logger.info(f"Price reference reset for {price_data['symbol']} to ${current_price:.8f}")
+            logger.info(f"Price reference reset for user {user_id}, token {price_data['symbol']} to ${current_price:.8f}")
             
-            # Send confirmation message
+            # Get user's threshold for this token
+            threshold_config = self.user_manager.get_user_threshold(user_id, token_address)
+            
+            # Send confirmation message to specific user
             message = f"🔄 **Price Reference Reset**\n\n"
             message += f"📊 **Token:** {price_data['name']} ({price_data['symbol']})\n"
             message += f"💰 **New Reference Price:** ${current_price:.8f}\n"
             message += f"📈 **Market Cap:** ${price_data.get('market_cap', 0):,.2f}\n"
             message += f"💧 **Liquidity:** ${price_data.get('liquidity', 0):,.2f}\n"
             message += f"⏰ **Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
+            message += f"🎯 **Your Threshold:** {threshold_config['value']}% ({threshold_config['direction']})\n"
             message += f"✅ Future alerts will use this as the new baseline price."
             
-            await self.notifier.send_message(message)
+            await self.notifier.send_message_to_user(user_id, message)
             
             return current_price
             
         except Exception as e:
-            logger.error(f"Error resetting price reference for {token_address}: {e}")
+            logger.error(f"Error resetting price reference for user {user_id}, token {token_address}: {e}")
             raise
     
-    def get_token_threshold(self, token_address: str) -> float:
-        """Get the threshold value for a specific token (returns global if no specific threshold)"""
-        token_config = self.token_thresholds.get(token_address, {'value': self.price_threshold})
-        return token_config.get('value', self.price_threshold)
+    def get_token_threshold(self, user_id: str, token_address: str) -> float:
+        """Get the threshold value for a specific token for a user"""
+        threshold_config = self.user_manager.get_user_threshold(user_id, token_address)
+        return threshold_config['value']
     
-    def get_token_direction(self, token_address: str) -> str:
-        """Get the direction for a specific token"""
-        token_config = self.token_thresholds.get(token_address, {'direction': 'both'})
-        return token_config.get('direction', 'both')
+    def get_token_direction(self, user_id: str, token_address: str) -> str:
+        """Get the direction for a specific token for a user"""
+        threshold_config = self.user_manager.get_user_threshold(user_id, token_address)
+        return threshold_config['direction']
     
     def get_token_by_name_or_symbol(self, query: str) -> Optional[str]:
         """Find token address by name or symbol"""
         query_lower = query.lower()
         # Simple lookup from cached token data
-        for token_address in self.tokens:
+        all_tokens = self.user_manager.get_all_tracked_tokens()
+        for token_address in all_tokens:
             # We would need to store token metadata somewhere accessible
             # For now, return None - this needs the storage system
             pass
@@ -313,7 +417,8 @@ class TokenTracker:
                     token_address = found_address
                 else:
                     # Search through tracked tokens for matching name/symbol
-                    for tracked_address in self.tokens:
+                    all_tokens = self.user_manager.get_all_tracked_tokens()
+                    for tracked_address in all_tokens:
                         try:
                             async with self.dexscreener_api:
                                 temp_data = await self.dexscreener_api.get_token_price(tracked_address)
@@ -326,9 +431,10 @@ class TokenTracker:
                     else:
                         raise APIError(f"Token '{token_identifier}' not found in tracked tokens")
             
-            # Check if token is being tracked
-            if token_address not in self.tokens:
-                raise APIError(f"Token '{token_identifier}' is not being tracked")
+            # Check if token is being tracked by any user
+            all_tokens = self.user_manager.get_all_tracked_tokens()
+            if token_address not in all_tokens:
+                raise APIError(f"Token '{token_identifier}' is not being tracked by any user")
             
             # Get current data
             async with self.dexscreener_api:
@@ -352,7 +458,7 @@ class TokenTracker:
             logger.error(f"Error getting token info for {token_identifier}: {e}")
             raise APIError(f"Error getting token info: {str(e)}")
     
-    async def _send_token_added_confirmation(self, token_address: str):
+    async def _send_token_added_confirmation(self, user_id: str, token_address: str):
         """Send Telegram confirmation with detailed token information when a new token is added"""
         try:
             # Get detailed token data from DexScreener
@@ -367,11 +473,19 @@ class TokenTracker:
                 logger.warning(f"Could not get holder count for {token_address}: {e}")
                 token_data['holder_count'] = 0
             
+            # Get user's threshold for this token
+            threshold_config = self.user_manager.get_user_threshold(user_id, token_address)
+            
+            # Get entry price
+            entry_price = self.user_manager.get_entry_price(user_id, token_address)
+            
             # Format confirmation message with only requested variables
             message = f"🎯 **Token Successfully Added to Tracking!**\n\n"
             message += f"🏷️ **Name:** {token_data['name']}\n"
             message += f"🔤 **Symbol:** {token_data['symbol']}\n"
             message += f"🔗 **Address:** `{token_address}`\n"
+            if entry_price:
+                message += f"💰 **Entry Price:** ${entry_price:.8f}\n"
             message += f"📈 **Market Cap:** ${token_data.get('market_cap', 0):,.2f}\n"
             message += f"💧 **Liquidity:** ${token_data.get('liquidity', 0):,.2f}\n"
             message += f"📊 **24h Volume:** ${token_data.get('volume_24h', 0):,.2f}\n"
@@ -441,12 +555,15 @@ class TokenTracker:
             if token_data.get('image_url'):
                 message += f"🖼️ **Image:** [View]({token_data['image_url']})\n"
             
-            message += f"\n🎯 **Now tracking for price changes >= {self.price_threshold}%**"
+            message += f"\n🎯 **Your Alert Settings:**\n"
+            message += f"📊 **Threshold:** {threshold_config['value']}%\n"
+            message += f"🔄 **Direction:** {threshold_config['direction']}\n"
             
-            await self.notifier.send_message(message)
+            await self.notifier.send_message_to_user(user_id, message)
             
         except Exception as e:
             logger.error(f"Error sending token added confirmation: {e}")
             # Send basic confirmation if detailed data fails
-            basic_message = f"✅ **Token Added to Tracking**\n\nAddress: `{token_address}`\nNow monitoring for price changes >= {self.price_threshold}%"
-            await self.notifier.send_message(basic_message)
+            threshold_config = self.user_manager.get_user_threshold(user_id, token_address)
+            basic_message = f"✅ **Token Added to Tracking**\n\nAddress: `{token_address}`\nNow monitoring for price changes >= {threshold_config['value']}% ({threshold_config['direction']})"
+            await self.notifier.send_message_to_user(user_id, basic_message)

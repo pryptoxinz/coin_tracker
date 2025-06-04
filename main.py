@@ -10,6 +10,7 @@ sys.path.append(str(Path(__file__).parent))
 
 from src.tracker import TokenTracker
 from src.storage import CSVStorage
+from src.storage.user_manager import UserManager
 from src.bot import TelegramNotifier, TelegramHandler
 from src.utils import config
 
@@ -89,35 +90,48 @@ async def main():
     
     storage = CSVStorage(config.data_dir)
     
-    # Load previously tracked tokens from storage
-    tokens_to_track, token_thresholds = await storage.load_tracked_tokens()
-    if not tokens_to_track:
-        tokens_to_track = DEFAULT_TOKENS
-        token_thresholds = {}
+    # Initialize UserManager for multi-user support
+    user_manager = UserManager()
     
-    active_chat_ids = config.get_active_chat_ids()
+    # Legacy migration: load previously tracked tokens from storage
+    try:
+        tokens_to_track, token_thresholds = await storage.load_tracked_tokens()
+        if tokens_to_track and not user_manager.get_all_tracked_tokens():
+            # Migrate legacy tokens to first user if any
+            active_chat_ids = config.get_active_chat_ids()
+            if active_chat_ids:
+                first_user = active_chat_ids[0]
+                logger.info(f"Migrating {len(tokens_to_track)} legacy tokens to user {first_user}")
+                for token in tokens_to_track:
+                    user_manager.add_token_to_user(first_user, token)
+                for token, threshold_data in token_thresholds.items():
+                    user_manager.set_user_token_threshold(
+                        first_user, token, 
+                        threshold_data['value'], 
+                        threshold_data['direction']
+                    )
+    except Exception as e:
+        logger.warning(f"Could not load legacy tokens: {e}")
     
-    telegram_handler = TelegramHandler()
+    telegram_handler = TelegramHandler(user_manager)
     
     notifier = TelegramNotifier(
         bot_token=config.telegram_bot_token,
-        chat_ids=telegram_handler.registered_users
+        chat_ids=user_manager.get_active_users()
     )
     
     tracker = TokenTracker(
-        tokens=tokens_to_track,
-        price_threshold=config.price_change_threshold,
+        user_manager=user_manager,
         storage=storage,
         notifier=notifier,
-        check_interval=config.check_interval,
-        token_thresholds=token_thresholds
+        check_interval=config.check_interval
     )
     
     telegram_handler.set_tracker(tracker)
     
     async def update_notifier_chat_ids():
         while True:
-            notifier.update_chat_ids(list(telegram_handler.registered_users))
+            notifier.update_chat_ids(user_manager.get_active_users())
             await asyncio.sleep(5)
     
     bot_info = await notifier.bot.get_me()
@@ -131,24 +145,32 @@ async def main():
     print(f"Bot URL: https://t.me/{bot_info.username}")
     print(f"{'='*50}\n")
     
-    if active_chat_ids:
-        logger.info(f"👥 Found {len(active_chat_ids)} registered users")
-        print(f"Found {len(active_chat_ids)} registered users")
+    active_users = user_manager.get_active_users()
+    all_tracked_tokens = user_manager.get_all_tracked_tokens()
+    
+    if active_users:
+        logger.info(f"👥 Found {len(active_users)} registered users")
+        print(f"Found {len(active_users)} registered users")
     else:
         logger.warning("👥 No registered users yet")
         print("No registered users yet. Send /start to the bot!")
     
-    if tokens_to_track:
-        logger.info(f"📈 Tracking {len(tokens_to_track)} tokens: {', '.join(tokens_to_track[:3])}{'...' if len(tokens_to_track) > 3 else ''}")
-        print(f"\nTracking {len(tokens_to_track)} tokens")
+    if all_tracked_tokens:
+        logger.info(f"📈 Tracking {len(all_tracked_tokens)} tokens across all users")
+        print(f"\nTracking {len(all_tracked_tokens)} tokens across all users")
+        for user_id in active_users:
+            user_tokens = user_manager.get_user_tokens(user_id)
+            if user_tokens:
+                logger.info(f"  User {user_id}: {len(user_tokens)} tokens")
     else:
         logger.info("📈 No tokens configured for tracking yet")
         print(f"\nNo tokens configured for tracking yet")
     
-    logger.info(f"⚙️ Price change threshold: {config.price_change_threshold}%")
+    logger.info(f"⚙️ Default price change threshold: {config.price_change_threshold}%")
     logger.info(f"⏱️ Check interval: {config.check_interval} seconds")
-    print(f"Price change threshold: {config.price_change_threshold}%")
+    print(f"Default price change threshold: {config.price_change_threshold}%")
     print(f"Check interval: {config.check_interval} seconds")
+    print("\nNote: Each user can set their own thresholds")
     print("\nPress Ctrl+C to stop\n")
     
     try:

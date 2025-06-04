@@ -3,11 +3,12 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from typing import Optional, Set
 from ..utils import config
+from ..storage.user_manager import UserManager
 
 class TelegramHandler:
-    def __init__(self):
+    def __init__(self, user_manager: UserManager):
         self.app: Optional[Application] = None
-        self.registered_users: Set[str] = set(config.get_active_chat_ids())
+        self.user_manager = user_manager
         self.tracker = None
     
     def set_tracker(self, tracker):
@@ -42,13 +43,16 @@ class TelegramHandler:
         chat_id = str(update.effective_chat.id)
         user_name = update.effective_user.username or update.effective_user.first_name
         
-        config.save_chat_id(chat_id)
-        self.registered_users.add(chat_id)
+        # Register user with UserManager
+        self.user_manager.register_user(chat_id, user_name)
+        
+        # Get user's threshold
+        user_threshold = self.user_manager.get_user_threshold(chat_id)
         
         welcome_message = (
             f"Welcome {user_name}! 🚀\n\n"
             "Your chat ID has been saved. You will now receive alerts for:\n"
-            f"• Price changes > {config.price_change_threshold}%\n"
+            f"• Price changes > {user_threshold}%\n"
             f"• Significant holder count changes\n\n"
             "Use the buttons below or type commands:"
         )
@@ -61,11 +65,24 @@ class TelegramHandler:
         if not await self._is_authorized(update):
             return
         
+        chat_id = str(update.effective_chat.id)
+        user_data = self.user_manager.get_user(chat_id)
+        
+        if not user_data:
+            await update.message.reply_text("User not found. Please send /start first.", reply_markup=self.get_main_menu_keyboard())
+            return
+        
+        # Get user's tokens count
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
         status_message = (
             f"🟢 Bot Status: Active\n\n"
-            f"Price Threshold: {config.price_change_threshold}%\n"
-            f"Check Interval: {config.check_interval}s\n"
-            f"Tracked Tokens: {len(self.tracker.tokens) if self.tracker else 0}\n"
+            f"Your Settings:\n"
+            f"• Price Threshold: {user_data['threshold']}%\n"
+            f"• Tracked Tokens: {len(user_tokens)}\n"
+            f"• Alerts: {'Enabled' if user_data['active'] else 'Disabled'}\n\n"
+            f"Global Settings:\n"
+            f"• Check Interval: {config.check_interval}s\n"
         )
         
         await update.message.reply_text(status_message, reply_markup=self.get_main_menu_keyboard())
@@ -74,15 +91,18 @@ class TelegramHandler:
         if not await self._is_authorized(update):
             return
         
-        if not self.tracker or not self.tracker.tokens:
-            await update.message.reply_text("No tokens are being tracked.")
+        chat_id = str(update.effective_chat.id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if not user_tokens:
+            await update.message.reply_text("You are not tracking any tokens.", reply_markup=self.get_main_menu_keyboard())
             return
         
-        message = "📊 Tracked Tokens:\n\n"
-        for i, token in enumerate(self.tracker.tokens, 1):
-            threshold = self.tracker.get_token_threshold(token)
-            direction = self.tracker.get_token_direction(token)
-            global_threshold = self.tracker.price_threshold
+        message = "📊 Your Tracked Tokens:\n\n"
+        for i, (token_address, token_data) in enumerate(user_tokens.items(), 1):
+            threshold = token_data['threshold']
+            direction = token_data.get('direction', 'both')
+            user_global_threshold = self.user_manager.get_user_threshold(chat_id)
             
             direction_emoji = {
                 'both': '📊',
@@ -91,15 +111,18 @@ class TelegramHandler:
             }.get(direction, '📊')
             
             # Get token name/symbol for display
-            try:
-                token_data = await self.tracker.get_token_info_with_timestamp(token)
-                token_display = f"${token_data['symbol']}"
-            except:
-                # Fallback to shortened address if token info unavailable
-                token_display = f"{token[:8]}...{token[-8:]}"
+            if self.tracker:
+                try:
+                    token_info = await self.tracker.get_token_info_with_timestamp(token_address)
+                    token_display = f"${token_info['symbol']}"
+                except:
+                    # Fallback to shortened address if token info unavailable
+                    token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            else:
+                token_display = f"{token_address[:8]}...{token_address[-8:]}"
             
-            if threshold == global_threshold and direction == 'both':
-                message += f"{i}. <code>{token_display}</code> {direction_emoji} (Global: {threshold}%)\n"
+            if threshold == user_global_threshold and direction == 'both':
+                message += f"{i}. <code>{token_display}</code> {direction_emoji} (Your Default: {threshold}%)\n"
             else:
                 message += f"{i}. <code>{token_display}</code> {direction_emoji} (Custom: {threshold}% {direction})\n"
         
@@ -119,11 +142,10 @@ class TelegramHandler:
                 await update.message.reply_text("Threshold must be between 0 and 100", reply_markup=self.get_main_menu_keyboard())
                 return
             
-            config.price_change_threshold = new_threshold
-            if self.tracker:
-                self.tracker.update_threshold(new_threshold)
+            chat_id = str(update.effective_chat.id)
+            self.user_manager.set_user_threshold(chat_id, new_threshold)
             
-            await update.message.reply_text(f"✅ Price threshold updated to {new_threshold}%", reply_markup=self.get_main_menu_keyboard())
+            await update.message.reply_text(f"✅ Your price threshold updated to {new_threshold}%", reply_markup=self.get_main_menu_keyboard())
         except ValueError:
             await update.message.reply_text("Invalid threshold value. Please enter a number.", reply_markup=self.get_main_menu_keyboard())
     
@@ -159,15 +181,15 @@ class TelegramHandler:
                 await update.message.reply_text("Threshold must be between 0 and 100")
                 return
             
-            if not self.tracker:
-                await update.message.reply_text("Tracker not available.")
+            chat_id = str(update.effective_chat.id)
+            user_tokens = self.user_manager.get_user_tokens(chat_id)
+            
+            if token_address not in user_tokens:
+                await update.message.reply_text(f"You are not tracking this token. Add it first with /add")
                 return
             
-            if token_address not in self.tracker.tokens:
-                await update.message.reply_text(f"Token {token_address} is not being tracked.")
-                return
-            
-            await self.tracker.set_token_threshold(token_address, threshold, direction)
+            # Update token threshold for this user
+            self.user_manager.set_token_threshold(chat_id, token_address, threshold, direction)
             
             # Add inline keyboard
             keyboard = [
@@ -187,13 +209,17 @@ class TelegramHandler:
                 'negative': '📉'
             }.get(direction, '📊')
             
-            try:
-                token_data = await self.tracker.get_token_info_with_timestamp(token_address)
-                token_display = f"${token_data['symbol']}"
-            except:
+            if self.tracker:
+                try:
+                    token_data = await self.tracker.get_token_info_with_timestamp(token_address)
+                    token_display = f"${token_data['symbol']}"
+                except:
+                    token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            else:
                 token_display = f"{token_address[:8]}...{token_address[-8:]}"
+                
             await update.message.reply_text(
-                f"✅ Threshold for {token_display} set to {threshold}% {direction_emoji} ({direction})",
+                f"✅ Your threshold for {token_display} set to {threshold}% {direction_emoji} ({direction})",
                 reply_markup=reply_markup
             )
             
@@ -209,13 +235,22 @@ class TelegramHandler:
             return
         
         token_address = context.args[0]
+        chat_id = str(update.effective_chat.id)
         
-        if self.tracker:
-            if token_address in self.tracker.tokens:
-                await update.message.reply_text("This token is already being tracked.", reply_markup=self.get_main_menu_keyboard())
-                return
-            
+        # Check if user already tracks this token
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        if token_address in user_tokens:
+            await update.message.reply_text("You are already tracking this token.", reply_markup=self.get_main_menu_keyboard())
+            return
+        
+        # Add token for this user
+        self.user_manager.add_user_token(chat_id, token_address)
+        
+        # Also add to tracker if not already there
+        if self.tracker and token_address not in self.tracker.tokens:
             await self.tracker.add_token(token_address)
+        
+        await update.message.reply_text(f"✅ Token added to your tracking list!", reply_markup=self.get_main_menu_keyboard())
     
     async def get_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._is_authorized(update):
@@ -330,14 +365,30 @@ class TelegramHandler:
             return
         
         token_address = context.args[0]
+        chat_id = str(update.effective_chat.id)
         
+        # Check if user tracks this token
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        if token_address not in user_tokens:
+            await update.message.reply_text("You are not tracking this token.", reply_markup=self.get_main_menu_keyboard())
+            return
+        
+        # Remove token for this user
+        self.user_manager.remove_user_token(chat_id, token_address)
+        
+        # Check if any other users are tracking this token
+        # If not, remove from tracker
         if self.tracker:
-            if token_address not in self.tracker.tokens:
-                await update.message.reply_text("This token is not being tracked.", reply_markup=self.get_main_menu_keyboard())
-                return
+            still_tracked = False
+            for user_id in self.user_manager.get_active_users():
+                if token_address in self.user_manager.get_user_tokens(user_id):
+                    still_tracked = True
+                    break
             
-            await self.tracker.remove_token(token_address)
-            await update.message.reply_text(f"✅ Removed token: <code>{token_address}</code>", parse_mode='HTML', reply_markup=self.get_main_menu_keyboard())
+            if not still_tracked and token_address in self.tracker.tokens:
+                await self.tracker.remove_token(token_address)
+        
+        await update.message.reply_text(f"✅ Removed token from your tracking list", parse_mode='HTML', reply_markup=self.get_main_menu_keyboard())
     
     async def reset_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reset price reference for a token: /reset <token_address>"""
@@ -356,23 +407,27 @@ class TelegramHandler:
             return
         
         token_address = context.args[0]
+        chat_id = str(update.effective_chat.id)
         
         if not self.tracker:
             await update.message.reply_text("Tracker not available.", reply_markup=self.get_main_menu_keyboard())
             return
         
-        if token_address not in self.tracker.tokens:
-            await update.message.reply_text(f"Token {token_address} is not being tracked.", reply_markup=self.get_main_menu_keyboard())
+        # Check if user tracks this token
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        if token_address not in user_tokens:
+            await update.message.reply_text(f"You are not tracking this token.", reply_markup=self.get_main_menu_keyboard())
             return
         
         try:
-            new_price = await self.tracker.reset_price_reference(token_address)
+            # Reset price reference for this user
+            new_price = await self.tracker.reset_price_reference_for_user(token_address, chat_id)
             short_token = f"{token_address[:8]}...{token_address[-8:]}"
             await update.message.reply_text(
                 f"✅ **Price Reference Reset**\n\n"
                 f"Token: {short_token}\n"
                 f"New reference price: ${new_price:.8f}\n\n"
-                f"Future alerts will use this as the baseline price.",
+                f"Your future alerts will use this as the baseline price.",
                 parse_mode='Markdown',
                 reply_markup=self.get_main_menu_keyboard()
             )
@@ -382,9 +437,10 @@ class TelegramHandler:
     async def stop_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = str(update.effective_chat.id)
         
-        if chat_id in self.registered_users:
-            self.registered_users.remove(chat_id)
-            await update.message.reply_text("You have been unsubscribed from alerts. Send /start to subscribe again.", reply_markup=self.get_main_menu_keyboard())
+        # Deactivate user
+        self.user_manager.deactivate_user(chat_id)
+        
+        await update.message.reply_text("You have been unsubscribed from alerts. Send /start to subscribe again.", reply_markup=self.get_main_menu_keyboard())
     
     async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle button presses"""
@@ -435,27 +491,44 @@ class TelegramHandler:
         if not await self._is_authorized_query(query):
             return
         
+        chat_id = str(query.from_user.id)
+        user_data = self.user_manager.get_user(chat_id)
+        
+        if not user_data:
+            await query.edit_message_text("User not found. Please send /start first.", reply_markup=self.get_main_menu_keyboard())
+            return
+        
+        # Get user's tokens count
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
         status_message = (
             f"🟢 Bot Status: Active\n\n"
-            f"Price Threshold: {config.price_change_threshold}%\n"
-            f"Check Interval: {config.check_interval}s\n"
-            f"Tracked Tokens: {len(self.tracker.tokens) if self.tracker else 0}\n"
+            f"Your Settings:\n"
+            f"• Price Threshold: {user_data['threshold']}%\n"
+            f"• Tracked Tokens: {len(user_tokens)}\n"
+            f"• Alerts: {'Enabled' if user_data['active'] else 'Disabled'}\n\n"
+            f"Global Settings:\n"
+            f"• Check Interval: {config.check_interval}s\n"
         )
+        
         await query.edit_message_text(status_message, reply_markup=self.get_main_menu_keyboard())
     
     async def _handle_tokens_button(self, query, context):
         if not await self._is_authorized_query(query):
             return
         
-        if not self.tracker or not self.tracker.tokens:
-            await query.edit_message_text("No tokens are being tracked.", reply_markup=self.get_main_menu_keyboard())
+        chat_id = str(query.from_user.id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if not user_tokens:
+            await query.edit_message_text("You are not tracking any tokens.", reply_markup=self.get_main_menu_keyboard())
             return
         
-        message = "📊 Tracked Tokens:\n\n"
-        for i, token in enumerate(self.tracker.tokens, 1):
-            threshold = self.tracker.get_token_threshold(token)
-            direction = self.tracker.get_token_direction(token)
-            global_threshold = self.tracker.price_threshold
+        message = "📊 Your Tracked Tokens:\n\n"
+        for i, (token_address, token_data) in enumerate(user_tokens.items(), 1):
+            threshold = token_data['threshold']
+            direction = token_data.get('direction', 'both')
+            user_global_threshold = self.user_manager.get_user_threshold(chat_id)
             
             direction_emoji = {
                 'both': '📊',
@@ -464,15 +537,18 @@ class TelegramHandler:
             }.get(direction, '📊')
             
             # Get token name/symbol for display
-            try:
-                token_data = await self.tracker.get_token_info_with_timestamp(token)
-                token_display = f"${token_data['symbol']}"
-            except:
-                # Fallback to shortened address if token info unavailable
-                token_display = f"{token[:8]}...{token[-8:]}"
+            if self.tracker:
+                try:
+                    token_info = await self.tracker.get_token_info_with_timestamp(token_address)
+                    token_display = f"${token_info['symbol']}"
+                except:
+                    # Fallback to shortened address if token info unavailable
+                    token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            else:
+                token_display = f"{token_address[:8]}...{token_address[-8:]}"
             
-            if threshold == global_threshold and direction == 'both':
-                message += f"{i}. <code>{token_display}</code> {direction_emoji} (Global: {threshold}%)\n"
+            if threshold == user_global_threshold and direction == 'both':
+                message += f"{i}. <code>{token_display}</code> {direction_emoji} (Your Default: {threshold}%)\n"
             else:
                 message += f"{i}. <code>{token_display}</code> {direction_emoji} (Custom: {threshold}% {direction})\n"
         
@@ -494,19 +570,25 @@ class TelegramHandler:
         if not await self._is_authorized_query(query):
             return
         
-        if not self.tracker or not self.tracker.tokens:
-            await query.edit_message_text("No tokens are being tracked.", reply_markup=self.get_main_menu_keyboard())
+        chat_id = str(query.from_user.id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if not user_tokens:
+            await query.edit_message_text("You are not tracking any tokens.", reply_markup=self.get_main_menu_keyboard())
             return
         
         # Create buttons for each token to remove
         keyboard = []
-        for token in self.tracker.tokens[:10]:  # Limit to 10 tokens
-            try:
-                token_data = await self.tracker.get_token_info_with_timestamp(token)
-                token_display = f"${token_data['symbol']}"
-            except:
-                token_display = f"{token[:8]}...{token[-8:]}"
-            keyboard.append([InlineKeyboardButton(f"❌ {token_display}", callback_data=f"remove:{token}")])
+        for token_address in list(user_tokens.keys())[:10]:  # Limit to 10 tokens
+            if self.tracker:
+                try:
+                    token_data = await self.tracker.get_token_info_with_timestamp(token_address)
+                    token_display = f"${token_data['symbol']}"
+                except:
+                    token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            else:
+                token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            keyboard.append([InlineKeyboardButton(f"❌ {token_display}", callback_data=f"remove:{token_address}")])
         
         keyboard.append([InlineKeyboardButton("« Back", callback_data="back_to_main")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -531,9 +613,12 @@ class TelegramHandler:
         if not await self._is_authorized_query(query):
             return
         
+        chat_id = str(query.from_user.id)
+        user_threshold = self.user_manager.get_user_threshold(chat_id)
+        
         await query.edit_message_text(
             "To set a new price threshold, send me a number.\n\n"
-            f"Current threshold: {config.price_change_threshold}%\n"
+            f"Your current threshold: {user_threshold}%\n"
             "Example: <code>15</code> (for 15%)",
             parse_mode='HTML',
             reply_markup=self.get_main_menu_keyboard()
@@ -542,51 +627,49 @@ class TelegramHandler:
     async def _handle_stop_alerts_button(self, query, context):
         chat_id = str(query.from_user.id)
         
-        if chat_id in self.registered_users:
-            self.registered_users.remove(chat_id)
-            await query.edit_message_text("You have been unsubscribed from alerts. Send /start to subscribe again.", reply_markup=self.get_main_menu_keyboard())
-        else:
-            await query.edit_message_text("You are not currently subscribed to alerts.", reply_markup=self.get_main_menu_keyboard())
+        # Deactivate user
+        self.user_manager.deactivate_user(chat_id)
+        
+        await query.edit_message_text("You have been unsubscribed from alerts. Send /start to subscribe again.", reply_markup=self.get_main_menu_keyboard())
     
     async def _handle_remove_specific_token(self, query, context, token_address):
         if not await self._is_authorized_query(query):
             return
         
+        chat_id = str(query.from_user.id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if token_address not in user_tokens:
+            await query.edit_message_text("You are not tracking this token.", reply_markup=self.get_main_menu_keyboard())
+            return
+        
+        # Remove token for this user
+        self.user_manager.remove_user_token(chat_id, token_address)
+        
+        # Check if any other users are tracking this token
         if self.tracker:
-            if token_address not in self.tracker.tokens:
-                await query.edit_message_text("This token is not being tracked.", reply_markup=self.get_main_menu_keyboard())
-                return
+            still_tracked = False
+            for user_id in self.user_manager.get_active_users():
+                if token_address in self.user_manager.get_user_tokens(user_id):
+                    still_tracked = True
+                    break
             
+            if not still_tracked and token_address in self.tracker.tokens:
+                await self.tracker.remove_token(token_address)
+        
+        if self.tracker:
             try:
                 token_data = await self.tracker.get_token_info_with_timestamp(token_address)
                 token_display = f"${token_data['symbol']}"
             except:
                 token_display = f"{token_address[:8]}...{token_address[-8:]}"
-            
-            await self.tracker.remove_token(token_address)
-            await query.edit_message_text(f"✅ Removed token: {token_display}", reply_markup=self.get_main_menu_keyboard())
+        else:
+            token_display = f"{token_address[:8]}...{token_address[-8:]}"
+        
+        await query.edit_message_text(f"✅ Removed token: {token_display}", reply_markup=self.get_main_menu_keyboard())
     
     async def _handle_back_to_main(self, query, context):
         # Recreate main menu
-        keyboard = [
-            [
-                InlineKeyboardButton("📊 Status", callback_data="status"),
-                InlineKeyboardButton("🪙 Tokens", callback_data="tokens")
-            ],
-            [
-                InlineKeyboardButton("➕ Add Token", callback_data="add_token"),
-                InlineKeyboardButton("➖ Remove Token", callback_data="remove_token")
-            ],
-            [
-                InlineKeyboardButton("📈 Get Token Info", callback_data="get_token"),
-                InlineKeyboardButton("⚙️ Set Threshold", callback_data="set_threshold")
-            ],
-            [
-                InlineKeyboardButton("❌ Stop Alerts", callback_data="stop_alerts")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
         await query.edit_message_text("🏠 Main Menu - Use the buttons below or type commands:", reply_markup=self.get_main_menu_keyboard())
     
     async def _handle_track_token(self, query, context, token_address):
@@ -598,11 +681,20 @@ class TelegramHandler:
             await query.edit_message_text("Tracker not available.", reply_markup=self.get_main_menu_keyboard())
             return
         
-        if token_address in self.tracker.tokens:
-            await query.edit_message_text("This token is already being tracked.", reply_markup=self.get_main_menu_keyboard())
+        chat_id = str(query.from_user.id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if token_address in user_tokens:
+            await query.edit_message_text("You are already tracking this token.", reply_markup=self.get_main_menu_keyboard())
             return
         
-        await self.tracker.add_token(token_address)
+        # Add token for this user
+        self.user_manager.add_user_token(chat_id, token_address)
+        
+        # Also add to tracker if not already there
+        if token_address not in self.tracker.tokens:
+            await self.tracker.add_token(token_address)
+        
         try:
             token_data = await self.tracker.get_token_info_with_timestamp(token_address)
             token_display = f"${token_data['symbol']}"
@@ -723,19 +815,23 @@ class TelegramHandler:
         if not await self._is_authorized_query(query):
             return
         
-        if not self.tracker or not self.tracker.tokens:
-            await query.edit_message_text("📊 Recap: No tokens are being tracked.", reply_markup=self.get_main_menu_keyboard())
+        chat_id = str(query.from_user.id)
+        user_data = self.user_manager.get_user(chat_id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if not user_tokens:
+            await query.edit_message_text("📊 Recap: You are not tracking any tokens.", reply_markup=self.get_main_menu_keyboard())
             return
         
-        recap_message = f"📊 **Daily Recap**\n\n"
-        recap_message += f"**Tracked Tokens:** {len(self.tracker.tokens)}\n"
-        recap_message += f"**Price Threshold:** {config.price_change_threshold}%\n"
-        recap_message += f"**Check Interval:** {config.check_interval}s\n\n"
-        recap_message += "**Recent Tokens:**\n"
+        recap_message = f"📊 **Your Daily Recap**\n\n"
+        recap_message += f"**Your Tracked Tokens:** {len(user_tokens)}\n"
+        recap_message += f"**Your Price Threshold:** {user_data['threshold']}%\n"
+        recap_message += f"**Alerts Status:** {'Enabled' if user_data['active'] else 'Disabled'}\n\n"
+        recap_message += "**Your Recent Tokens:**\n"
         
-        for i, token in enumerate(self.tracker.tokens[:5], 1):
-            threshold = self.tracker.get_token_threshold(token)
-            direction = self.tracker.get_token_direction(token)
+        for i, (token_address, token_data) in enumerate(list(user_tokens.items())[:5], 1):
+            threshold = token_data['threshold']
+            direction = token_data.get('direction', 'both')
             
             direction_emoji = {
                 'both': '📊',
@@ -744,17 +840,20 @@ class TelegramHandler:
             }.get(direction, '📊')
             
             # Get token name/symbol for display
-            try:
-                token_data = await self.tracker.get_token_info_with_timestamp(token)
-                token_display = f"${token_data['symbol']}"
-            except:
-                # Fallback to shortened address if token info unavailable
-                token_display = f"{token[:8]}...{token[-8:]}"
+            if self.tracker:
+                try:
+                    token_info = await self.tracker.get_token_info_with_timestamp(token_address)
+                    token_display = f"${token_info['symbol']}"
+                except:
+                    # Fallback to shortened address if token info unavailable
+                    token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            else:
+                token_display = f"{token_address[:8]}...{token_address[-8:]}"
             
             recap_message += f"{i}. `{token_display}` {direction_emoji} ({threshold}%)\n"
         
-        if len(self.tracker.tokens) > 5:
-            recap_message += f"... and {len(self.tracker.tokens) - 5} more tokens\n"
+        if len(user_tokens) > 5:
+            recap_message += f"... and {len(user_tokens) - 5} more tokens\n"
         
         await query.edit_message_text(recap_message, parse_mode='Markdown', reply_markup=self.get_main_menu_keyboard())
     
@@ -763,19 +862,25 @@ class TelegramHandler:
         if not await self._is_authorized_query(query):
             return
         
-        if not self.tracker or not self.tracker.tokens:
-            await query.edit_message_text("No tokens are being tracked.", reply_markup=self.get_main_menu_keyboard())
+        chat_id = str(query.from_user.id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if not user_tokens:
+            await query.edit_message_text("You are not tracking any tokens.", reply_markup=self.get_main_menu_keyboard())
             return
         
         # Create buttons for each token to reset price
         keyboard = []
-        for token in self.tracker.tokens[:10]:  # Limit to 10 tokens
-            try:
-                token_data = await self.tracker.get_token_info_with_timestamp(token)
-                token_display = f"${token_data['symbol']}"
-            except:
-                token_display = f"{token[:8]}...{token[-8:]}"
-            keyboard.append([InlineKeyboardButton(f"🔄 {token_display}", callback_data=f"reset_price:{token}")])
+        for token_address in list(user_tokens.keys())[:10]:  # Limit to 10 tokens
+            if self.tracker:
+                try:
+                    token_data = await self.tracker.get_token_info_with_timestamp(token_address)
+                    token_display = f"${token_data['symbol']}"
+                except:
+                    token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            else:
+                token_display = f"{token_address[:8]}...{token_address[-8:]}"
+            keyboard.append([InlineKeyboardButton(f"🔄 {token_display}", callback_data=f"reset_price:{token_address}")])
         
         keyboard.append([InlineKeyboardButton("« Back", callback_data="back_to_main")])
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -798,12 +903,15 @@ class TelegramHandler:
             await query.edit_message_text("Tracker not available.", reply_markup=self.get_main_menu_keyboard())
             return
         
-        if token_address not in self.tracker.tokens:
-            await query.edit_message_text("This token is not being tracked.", reply_markup=self.get_main_menu_keyboard())
+        chat_id = str(query.from_user.id)
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        
+        if token_address not in user_tokens:
+            await query.edit_message_text("You are not tracking this token.", reply_markup=self.get_main_menu_keyboard())
             return
         
         try:
-            new_price = await self.tracker.reset_price_reference(token_address)
+            new_price = await self.tracker.reset_price_reference_for_user(token_address, chat_id)
             try:
                 token_data = await self.tracker.get_token_info_with_timestamp(token_address)
                 token_display = f"${token_data['symbol']}"
@@ -813,7 +921,7 @@ class TelegramHandler:
                 f"✅ **Price Reference Reset**\n\n"
                 f"Token: {token_display}\n"
                 f"New reference price: ${new_price:.8f}\n\n"
-                f"Future alerts will use this as the baseline price.",
+                f"Your future alerts will use this as the baseline price.",
                 parse_mode='Markdown',
                 reply_markup=self.get_main_menu_keyboard()
             )
@@ -841,24 +949,24 @@ class TelegramHandler:
             "❓ **Help - Crypto Trading Bot**\n\n"
             "**Commands:**\n"
             "• `/start` - Initialize the bot and show menu\n"
-            "• `/status` - Show bot status and settings\n"
-            "• `/tokens` - List all tracked tokens\n"
+            "• `/status` - Show your bot status and settings\n"
+            "• `/tokens` - List your tracked tokens\n"
             "• `/add <address>` - Add a token to track\n"
             "• `/remove <address>` - Remove a token\n"
             "• `/get <name/symbol/address>` - Get token info\n"
-            "• `/threshold <number>` - Set global price threshold\n"
+            "• `/threshold <number>` - Set your global price threshold\n"
             "• `/setthreshold <address> <threshold> [direction]` - Set custom token threshold\n"
             "• `/reset <address>` - Reset price reference to current price\n"
             "• `/stop` - Stop receiving alerts\n\n"
             "**Buttons:**\n"
-            "• 📊 **Status** - View bot status\n"
-            "• 🪙 **Tokens** - View tracked tokens\n"
+            "• 📊 **Status** - View your bot status\n"
+            "• 🪙 **Tokens** - View your tracked tokens\n"
             "• ➕ **Add Token** - Instructions to add tokens\n"
             "• ➖ **Remove Token** - Select tokens to remove\n"
             "• 📈 **Get Token Info** - Instructions for token lookup\n"
             "• ⚙️ **Set Threshold** - Instructions to set price threshold\n"
             "• 🔄 **Reset Price** - Reset price reference for tokens\n"
-            "• 📊 **Recap** - Daily summary of tracked tokens\n"
+            "• 📊 **Recap** - Summary of your tracked tokens\n"
             "• ❓ **Help** - This help message\n"
             "• ❌ **Stop Alerts** - Unsubscribe from notifications\n\n"
             "**Tips:**\n"
@@ -867,7 +975,8 @@ class TelegramHandler:
             "• Send a token name/symbol to get info\n"
             "• Use custom thresholds for specific tokens\n"
             "• Set direction to 'positive', 'negative', or 'both'\n"
-            "• Reset price reference to start fresh tracking\n\n"
+            "• Reset price reference to start fresh tracking\n"
+            "• Each user has their own tracking list and settings\n\n"
             "**Examples:**\n"
             "• `6MQpbiTC2YcogidTmKqMLK82qvE9z5QEm7EP3AEDpump`\n"
             "• `15` (sets 15% threshold)\n"
@@ -905,37 +1014,43 @@ class TelegramHandler:
             await update.message.reply_text("Tracker not available.", reply_markup=self.get_main_menu_keyboard())
             return
         
+        chat_id = str(update.effective_chat.id)
+        
         # Check if already tracking
-        if token_address in self.tracker.tokens:
+        user_tokens = self.user_manager.get_user_tokens(chat_id)
+        if token_address in user_tokens:
             await update.message.reply_text(
-                f"⚠️ Token is already being tracked.\n\n"
+                f"⚠️ You are already tracking this token.\n\n"
                 f"Address: <code>{token_address}</code>",
                 parse_mode='HTML',
                 reply_markup=self.get_main_menu_keyboard()
             )
             return
         
-        # Add the token
-        await self.tracker.add_token(token_address)
+        # Add token for this user
+        self.user_manager.add_user_token(chat_id, token_address)
+        
+        # Also add to tracker if not already there
+        if token_address not in self.tracker.tokens:
+            await self.tracker.add_token(token_address)
         
         reply_markup = self.get_main_menu_keyboard()
         
         await update.message.reply_text(
-            f"✅ Token added successfully!\n\n"
+            f"✅ Token added to your tracking list!\n\n"
             f"Use the buttons below for more actions:",
             reply_markup=reply_markup
         )
     
     async def _handle_threshold_value(self, update: Update, threshold: float):
         """Handle when user sends a threshold value"""
-        config.price_change_threshold = threshold
-        if self.tracker:
-            self.tracker.update_threshold(threshold)
+        chat_id = str(update.effective_chat.id)
+        self.user_manager.set_user_threshold(chat_id, threshold)
         
         reply_markup = self.get_main_menu_keyboard()
         
         await update.message.reply_text(
-            f"✅ Price threshold updated to {threshold}%",
+            f"✅ Your price threshold updated to {threshold}%",
             reply_markup=reply_markup
         )
     
@@ -1067,14 +1182,16 @@ class TelegramHandler:
     
     async def _is_authorized_query(self, query) -> bool:
         chat_id = str(query.from_user.id)
-        if chat_id not in self.registered_users:
+        user_data = self.user_manager.get_user(chat_id)
+        if not user_data or not user_data['active']:
             await query.edit_message_text("Please send /start first to use this bot.", reply_markup=self.get_main_menu_keyboard())
             return False
         return True
     
     async def _is_authorized(self, update: Update) -> bool:
         chat_id = str(update.effective_chat.id)
-        if chat_id not in self.registered_users:
+        user_data = self.user_manager.get_user(chat_id)
+        if not user_data or not user_data['active']:
             await update.message.reply_text("Please send /start first to use this bot.", reply_markup=self.get_main_menu_keyboard())
             return False
         return True

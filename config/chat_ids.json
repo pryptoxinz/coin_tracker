@@ -1,6 +1,55 @@
 {
   "625872305": {
     "active": true,
-    "registered_at": "Wed Jun  4 07:45:21 PM CEST 2025"
+    "registered_at": "Wed Jun  4 07:45:21 PM CEST 2025",
+    "tracked_tokens": [],
+    "global_threshold": 20.0,
+    "token_thresholds": {},
+    "entry_prices": {}
+  },
+  "123456789": {
+    "active": true,
+    "registered_at": "Wed Jun 04 10:16:36 PM  2025",
+    "tracked_tokens": [
+      "kitty123456789"
+    ],
+    "global_threshold": 15.0,
+    "token_thresholds": {
+      "kitty123456789": {
+        "value": 10.0,
+        "direction": "both"
+      }
+    },
+    "entry_prices": {
+      "kitty123456789": {
+        "price": 0.0005,
+        "timestamp": "2025-06-04T22:16:36.985700"
+      }
+    }
+  },
+  "987654321": {
+    "active": true,
+    "registered_at": "Wed Jun 04 10:16:36 PM  2025",
+    "tracked_tokens": [
+      "6MQpbiTC2YcogidTmKqMLK82qvE9z5QEm7EP3AEDpump",
+      "kitty123456789"
+    ],
+    "global_threshold": 25.0,
+    "token_thresholds": {
+      "kitty123456789": {
+        "value": 30.0,
+        "direction": "positive"
+      }
+    },
+    "entry_prices": {
+      "6MQpbiTC2YcogidTmKqMLK82qvE9z5QEm7EP3AEDpump": {
+        "price": 0.0012,
+        "timestamp": "2025-06-04T22:16:36.985301"
+      },
+      "kitty123456789": {
+        "price": 0.0008,
+        "timestamp": "2025-06-04T22:16:36.986114"
+      }
+    }
   }
 }
